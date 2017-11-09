@@ -1,69 +1,61 @@
 package pool
 
 import (
-	"sync"
-	"time"
+	"context"
 	"errors"
-	"container/list"
+	"sync"
 )
 
-type Conn interface {
+type IConn interface {
 	Close() error
 	IsValid() bool
 }
 
-type idleConn struct {
-	c Conn
-	t time.Time
-}
-
 type Config struct {
-	DialFunc    func() (Conn, error)
-	MaxOpen     int
-	MinOpen     int
-	MaxIdle     int
-	IdleTimeout time.Duration
+	MaxOpen  int
+	MinOpen  int
+	DialFunc func() (IConn, error)
 }
 
 type Pool struct {
-	closed bool
-	active int
-	idle   list.List
-	co     *sync.Cond
+	c      *Config
 	mu     sync.Mutex
-	c      Config
+	conns  chan IConn
+	count  int
+	closed bool
 }
 
-func NewPool(c Config) (*Pool, error) {
-	if c.MaxOpen <= 0 || c.MinOpen > c.MaxOpen || c.MaxIdle > c.MaxOpen {
-		return nil, errors.New("config error")
+var (
+	errPoolIsClose  = errors.New("Connection pool has been closed")
+	errContextClose = errors.New("Get connection close by context")
+	errPoolIsFull   = errors.New("Pool is full")
+)
+
+func NewPool(c *Config) (*Pool, error) {
+	if c.MinOpen > c.MaxOpen || c.MaxOpen <= 0 {
+		return nil, errors.New("Number of connection bound error")
 	}
 
-	p :=  &Pool{c: c}
+	// 本大爷来了，尔等还不跪拜
+	p := &Pool{
+		c:     c,
+		conns: make(chan IConn, c.MaxOpen),
+	}
 
+	// 管他呢，先搞它十个八个的先
 	if c.MinOpen > 0 {
 		for i := 0; i < c.MinOpen; i++ {
-			c, e := p.c.DialFunc()
-			if e != nil {
-				return nil, e
+			if err := p.makeConn(); err != nil {
+				return nil, err
 			}
-
-			p.Put(c)
 		}
 	}
 
 	return p, nil
 }
 
-func (p *Pool) SetMaxIdle(num int) *Pool {
-	p.mu.Lock()
-	p.c.MaxIdle = num
-	p.mu.Unlock()
-
-	return p
-}
-
 func (p *Pool) SetMaxOpen(num int) *Pool {
+	// 比大更大
 	p.mu.Lock()
 	p.c.MaxOpen = num
 	p.mu.Unlock()
@@ -71,143 +63,114 @@ func (p *Pool) SetMaxOpen(num int) *Pool {
 	return p
 }
 
-func (p *Pool) Get() (Conn, error) {
-	p.mu.Lock()
-
-	if p.closed {
-		p.mu.Unlock()
-		return nil, errors.New("get on closed pool")
+func (p *Pool) Get(ctx context.Context, focusNew ...bool) (IConn, error) {
+	if p.isClosed() {
+		return nil, errPoolIsClose
 	}
 
-	if timeout := p.c.IdleTimeout; timeout > 0 {
-		for i, n := 0, p.idle.Len(); i < n; i++ {
-			e := p.idle.Back()
-			if e == nil {
-				break
-			}
-
-			ic := e.Value.(idleConn)
-			if ic.t.Add(timeout).After(time.Now()) {
-				break
-			}
-
-			p.idle.Remove(e)
-			p.release()
-
-			p.mu.Unlock()
-			ic.c.Close()
-			p.mu.Lock()
+	// 新欢口味好一些么？
+	if len(focusNew) > 0 && focusNew[0] {
+		conn, err := p.newConn()
+		if err != nil {
+			return nil, err
 		}
+
+		return conn, nil
 	}
 
-	for {
-		// 获取可用的连接
-		for i, n := 0, p.idle.Len(); i < n; i++ {
-			e := p.idle.Front()
-			if e == nil {
-				break
-			}
+	select {
+	// 看我无敌抓 xx 功
+	case conn := <-p.conns:
+		return conn, nil
+	default:
+		// 来吧，大爷温暖的怀抱等着你
+		p.makeConn()
 
-			ic := e.Value.(idleConn)
-			p.idle.Remove(e)
-			p.mu.Unlock()
-			if ic.c.IsValid() {
-				return ic.c, nil
-			}
-
-			ic.c.Close()
-			p.mu.Lock()
-			p.release()
-		}
-
-		// 获取新连接对象
-		if p.c.MaxOpen == 0 || p.active < p.c.MaxOpen {
-			p.active += 1
-			p.mu.Unlock()
-
-			c, err := p.c.DialFunc()
-			if err != nil {
-				p.mu.Lock()
-				p.release()
-				p.mu.Unlock()
-				c = nil
-			}
-
-			return c, err
-		}
-
-		if p.co == nil {
-			p.co = sync.NewCond(&p.mu)
-		}
-
-		// 等待通知信号
-		p.co.Wait()
-	}
-}
-
-func (p *Pool) Put(c Conn) error {
-	p.mu.Lock()
-
-	if !p.closed {
-		if !c.IsValid() {
-			p.release()
-			p.mu.Unlock()
-			return nil
-		}
-
-		p.idle.PushFront(idleConn{c: c, t: time.Now()})
-		if p.c.MaxIdle > 0 && p.idle.Len() > p.c.MaxIdle {
-			c = p.idle.Remove(p.idle.Back()).(idleConn).c
-		} else {
-			c = nil
+		// 你们谁先上...
+		select {
+		case conn := <-p.conns:
+			return conn, nil
+		case <-ctx.Done():
+			return nil, errContextClose
 		}
 	}
-
-	if c == nil {
-		if p.co != nil {
-			p.co.Signal()
-		}
-
-		p.mu.Unlock()
-		return nil
-	}
-
-	p.release()
-	p.mu.Unlock()
-
-	return c.Close()
 }
 
 func (p *Pool) Close() {
-	p.mu.Lock()
+	// 你们都不要我了么？
+	if !p.isClosed() {
+		p.mu.Lock()
 
-	idle := p.idle
-	p.idle.Init()
-	p.closed = true
-	p.active -= idle.Len()
-	if p.co != nil {
-		p.co.Broadcast()
-	}
+		p.closed = true
+		close(p.conns)
 
-	p.mu.Unlock()
+		// 一个一个的都去死
+		for conn := range p.conns {
+			conn.Close()
+		}
 
-	for e := idle.Front(); e != nil; e = e.Next() {
-		e.Value.(idleConn).c.Close()
+		p.mu.Unlock()
 	}
 }
 
-func (p *Pool) ActiveCount() int {
-	p.mu.Lock()
-	c := p.active
-	p.mu.Unlock()
+func (p *Pool) Release(conn IConn) {
+	if p.isClosed() {
+		return
+	}
 
-	return c
+	// 艹，坏了
+	if !conn.IsValid() {
+		p.mu.Lock()
+		p.count = p.count - 1
+		p.mu.Unlock()
+		return
+	}
+
+	select {
+	case p.conns <- conn:
+	default:
+		// 满了，塞不进去了，扔了算了
+		conn.Close()
+	}
 }
 
-func (p *Pool) release() {
-	p.active--
+func (p *Pool) isClosed() bool {
+	p.mu.Lock()
+	ret := p.closed
+	p.mu.Unlock()
 
-	if p.co != nil {
-		p.co.Signal()
+	return ret
+}
+
+func (p *Pool) makeConn() error {
+	conn, err := p.newConn()
+	if err != nil {
+		return err
 	}
+
+	// 大力点.. oh yeah ...
+	p.conns <- conn
+
+	return nil
+}
+
+func (p *Pool) newConn() (IConn, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// 满了满了，边玩去
+	if p.count >= p.c.MaxOpen {
+		return nil, errPoolIsFull
+	}
+
+	// 嗨，妹子，让我搞一下
+	conn, err := p.c.DialFunc()
+	if err != nil {
+		return nil, err
+	}
+
+	// 每次都加一，马上就要走上人生巅峰了啊
+	p.count += 1
+
+	return conn, nil
 }
