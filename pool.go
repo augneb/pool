@@ -144,18 +144,23 @@ func (p *Pool) makeConn() error {
 
 func (p *Pool) newConn() (IConn, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	if p.count >= p.c.MaxOpen {
+		p.mu.Unlock()
 		return nil, errPoolIsFull
 	}
 
+	p.count += 1
+	p.mu.Unlock()
+
 	conn, err := p.c.DialFunc()
 	if err != nil {
+		p.mu.Lock()
+		p.count -= 1
+		p.mu.Unlock()
+
 		return nil, err
 	}
-
-	p.count += 1
 
 	return conn, nil
 }
